@@ -1,0 +1,11 @@
+# 拉取rtsp流的地址
+[pull_stream]
+url = rtsp://ip:port/app/stream
+
+# 自建rtsp推流服务端配置
+[push_server]
+type = rtsp
+port = 8554
+vhost = __defaultVhost__
+app = app
+stream = stream
