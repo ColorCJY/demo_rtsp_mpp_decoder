@@ -1,26 +1,45 @@
-#include "mk_mediakit.h"
-#include "rtsp_server.h"
-#include "yolov8.h"
-#include "INIReader.h"
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <iostream>
 
-struct dma_data {
-    int width;
-    int height;
-    int format = RK_FORMAT_RGBA_8888;
-    int _fd = 0;
-    rga_buffer_handle_t handle;
-    char *buf = nullptr;
-};
+#include "mk_mediakit.h"
+#include "rtsp_server.h"
+#include "inference.h"
+#include "INIReader.h"
 
-struct Config {
-    PushServer pushServer; // 推流服务器配置
-    std::string pullStream; // 源服务器地址
-};
+std::unique_ptr<RtspServer> server_raw;
+std::unique_ptr<RtspServer> server_detect;
 
-dma_data rgba_data;
-std::unique_ptr<RtspServer> server;
+std::vector<std::string> GetAllLocalIPs() {
+    std::vector<std::string> ips;
+    struct ifaddrs *ifaddr, *ifa;
+    
+    if (getifaddrs(&ifaddr) == -1) {
+        return ips;
+    }
+    
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+        
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            void* addr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, addr, ip, INET_ADDRSTRLEN);
+            
+            std::string ip_str(ip);
+            // 排除回环地址
+            if (ip_str != "127.0.0.1") {
+                ips.push_back(ip_str);
+            }
+        }
+    }
+    
+    freeifaddrs(ifaddr);
+    return ips;
+}
 
 Config loadConfig(const std::string& filename) {
     Config config;
@@ -28,29 +47,61 @@ Config loadConfig(const std::string& filename) {
     
     if (reader.ParseError() < 0) {
         std::cerr << "无法加载配置文件: " << filename << std::endl;
-        // 可以设置默认值或抛出异常
         exit(1);
     }
     
-    // 读取pull_stream部分
     config.pullStream = reader.Get("pull_stream", "url", "");
     
-    // 读取push_server部分
+    // 推流服务器配置
     config.pushServer.type = reader.Get("push_server", "type", "rtsp");
     config.pushServer.port = reader.GetInteger("push_server", "port", 8554);
-    config.pushServer.vhost = reader.Get("push_server", "vhost", "__defaultVhost__");
-    config.pushServer.app = reader.Get("push_server", "app", "live");
-    config.pushServer.stream = reader.Get("push_server", "stream", "test");
+    
+    // 原始流配置
+    config.originStream.vhost = reader.Get("origin_stream", "vhost", "__defaultVhost__");
+    config.originStream.app = reader.Get("origin_stream", "app", "app");
+    config.originStream.stream = reader.Get("origin_stream", "stream", "origin");
+    
+    // 检测流配置
+    config.detectStream.vhost = reader.Get("detect_stream", "vhost", "__defaultVhost__");
+    config.detectStream.app = reader.Get("detect_stream", "app", "app");
+    config.detectStream.stream = reader.Get("detect_stream", "stream", "detect");
+
+    config.model_path = reader.Get("model_path", "path", "./model/yolov8n.rknn");
+    
+    config.inference_threads = reader.GetInteger("inference", "threads", 2);
+
 
     std::cout << "Pull Stream URL: " << config.pullStream << std::endl;
-    std::cout << "Push Server Type: " << config.pushServer.type << std::endl;
     std::cout << "Push Server Port: " << config.pushServer.port << std::endl;
-    std::cout << "Push Server Vhost: " << config.pushServer.vhost << std::endl;
-    std::cout << "Push Server App: " << config.pushServer.app << std::endl;
-    std::cout << "Push Server Stream: " << config.pushServer.stream << std::endl;
+    auto local_ips = GetAllLocalIPs();
+
+    std::cout << "Origin Stream (localhost): rtsp://localhost:" << config.pushServer.port
+            << "/" << config.originStream.app << "/" << config.originStream.stream << std::endl;
+
+    if (!local_ips.empty()) {
+        for (size_t i = 0; i < local_ips.size(); ++i) {
+            std::cout << "Origin Stream (network " << (i+1) << "): rtsp://" << local_ips[i] 
+                    << ":" << config.pushServer.port
+                    << "/" << config.originStream.app << "/" << config.originStream.stream << std::endl;
+        }
+    }
+
+    std::cout << "Detect Stream (localhost): rtsp://localhost:" << config.pushServer.port
+            << "/" << config.detectStream.app << "/" << config.detectStream.stream << std::endl;
+
+    if (!local_ips.empty()) {
+        for (size_t i = 0; i < local_ips.size(); ++i) {
+            std::cout << "Detect Stream (network " << (i+1) << "): rtsp://" << local_ips[i] 
+                    << ":" << config.pushServer.port
+                    << "/" << config.detectStream.app << "/" << config.detectStream.stream << std::endl;
+        }
+    }
+
+    std::cout << "Inference Threads: " << config.inference_threads << std::endl;
     
     return config;
 }
+
 
 static MppCodingType ConvertCodecType(int mk_codec) {
     if (mk_codec == MKCodecH264) return MPP_VIDEO_CodingAVC;
@@ -63,137 +114,207 @@ static MppCodingType ConvertCodecType(int mk_codec) {
 }
 
 void deal_coded_frame(uint8_t* data, uint32_t size, uint64_t pts, void* userdata) {
-    rknn_app_context_t *ctx = (rknn_app_context_t *)userdata;
-    if(server != nullptr) {
-        mk_media pMedia = server->getZlmMediaHandle();
+    if(server_detect != nullptr) {
+        mk_media pMedia = server_detect->getZlmMediaHandle();
         if(pMedia != nullptr) {
             mk_media_input_h264(pMedia, data, size, pts, pts);
         }
     }
 }
 
-void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_stride, int width, int height, int format, int fd, void *data)
-{
+// 编码回调函数（从推理线程调用）
+void inference_encode_callback(FrameContext* ctx, std::shared_ptr<dma_data_t> frame) {
+    std::unique_lock<std::mutex> lock(ctx->pending_mutex);
+    
+    // 将处理完的帧加入待编码队列
+    ctx->pending_frames[frame->frame_seq] = frame;
+    
+    lock.unlock();
+    ctx->pending_cv.notify_one();
+}
 
-    rknn_app_context_t *ctx = (rknn_app_context_t *)userdata;
-
-    int ret = 0;
-    int buf_size = width * height * get_bpp_from_format(rgba_data.format);;
-    rgba_data.width = width;
-    rgba_data.height = height;
-    static int src_frame_fd = -1;
-    static void *src_frame_buf = nullptr;
-    if(rgba_data.buf == nullptr) {
-        ret = dma_buf_alloc(CMA_HEAP_PATH, buf_size, &rgba_data._fd, (void **)&rgba_data.buf);
-        if (ret < 0) {
-            printf("alloc dma32_heap buffer failed!\n");
-            return;
+// 编码线程函数 - 按序编码
+void encode_thread_func(FrameContext* ctx) {
+    while(ctx->encoding_running) {
+        std::shared_ptr<dma_data_t> frame_to_encode;
+        
+        {
+            std::unique_lock<std::mutex> lock(ctx->pending_mutex);
+            
+            // 等待有数据或退出信号
+            ctx->pending_cv.wait(lock, [ctx]() {
+                return !ctx->pending_frames.empty() || !ctx->encoding_running;
+            });
+            
+            if(!ctx->encoding_running && ctx->pending_frames.empty()) {
+                break;
+            }
+            
+            // 查找当前应该编码的序列号
+            uint64_t expected_seq = ctx->encode_seq.load();
+            auto it = ctx->pending_frames.find(expected_seq);
+            
+            if(it != ctx->pending_frames.end()) {
+                frame_to_encode = it->second;
+                ctx->pending_frames.erase(it);
+                ctx->encode_seq++;
+            } else {
+                // 序列号不匹配，继续等待
+                continue;
+            }
+        }
+        
+        // 编码帧
+        if(frame_to_encode && ctx->encoder != nullptr) {
+            ctx->encoder->WriteData((u_char*)frame_to_encode->buf, frame_to_encode->size);
         }
     }
+}
 
-    memset(rgba_data.buf, 0x00, buf_size);
+void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_stride, 
+                                int width, int height, int format, int fd, void *data)
+{
+    FrameContext *ctx = (FrameContext *)userdata;
 
-    rga_buffer_t origin;
-    rga_buffer_t src;
-    rga_buffer_t rgba;
-
-    memset(&rgba, 0, sizeof(rgba));
-    rgba = wrapbuffer_fd(rgba_data._fd, width, height, rgba_data.format);
-
-    if (ctx->encoder == NULL)
-    {
+    // 初始化编码器和编码线程
+    if (ctx->encoder == nullptr) {
         RKEncodeVideo *rk_encoder = new RKEncodeVideo();
         InputInfo info;
         info.width = width;
         info.height = height;
-        info.fps = 25;
+        info.fps = ctx->fps;
         info.format = eFormatType::YUV420SP;
         int ret = rk_encoder->Initencoder(info, 0, deal_coded_frame, ctx);
         if(ret != 0) {
             delete rk_encoder;
             return;
         }
-        if(server != nullptr) {
-            mk_media pMedia = server->getZlmMediaHandle();
+        if(server_detect != nullptr) {
+            mk_media pMedia = server_detect->getZlmMediaHandle();
             if(pMedia != nullptr) {
                 mk_media_input_h264(pMedia, info.data, info.size, 0, 0);
             }
         }
         ctx->encoder = rk_encoder;
-    }
-
-    image_frame_t img;
-    img.width = width;
-    img.height = height;
-    img.width_stride = width_stride;
-    img.height_stride = height_stride;
-    img.fd = fd;
-    img.virt_addr = (char *)data;
-    img.format = RK_FORMAT_YCbCr_420_SP;
-    object_detect_result_list detect_result;
-    memset(&detect_result, 0, sizeof(object_detect_result_list));
-
-    ret = inference_model(ctx, &img, &detect_result);
-    if (ret != 0)
-    {
-        printf("inference model fail\n");
-        return;
-    }
-
-    if (src_frame_fd < 0) {
-        int yuv_size = width_stride * height_stride * 3 / 2;
-        ret = dma_buf_alloc(CMA_HEAP_PATH, yuv_size, &src_frame_fd, &src_frame_buf);
-        if (ret < 0) {
-            printf("alloc mpp frame buffer failed!\n");
-            return;
-        }
-    }
-
-    // Copy To another buffer avoid to modify mpp decoder buffer
-    origin = wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-    src = wrapbuffer_fd(src_frame_fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-    imcopy(origin, src);
-
-    // Draw objects
-    for (int i = 0; i < detect_result.count; i++)
-    {
-        object_detect_result *det_result = &(detect_result.results[i]);
-        // printf("%s @ (%d %d %d %d) %f\n", coco_cls_to_name(det_result->cls_id), det_result->box.left, det_result->box.top,
-        //     det_result->box.right, det_result->box.bottom, det_result->prop);
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        int x2 = det_result->box.right;
-        int y2 = det_result->box.bottom;
-
-        im_rect rect = {
-            std::max(0, x1),
-            std::max(0, y1),
-            std::min(x2, width - 1) - std::max(0, x1) + 1,
-            std::min(y2, height - 1) - std::max(0, y1) + 1
-        };
         
-        ret = imrectangle(rgba, rect, 0x00FF0000, 4);
-        if (ret != IM_STATUS_SUCCESS) {
-            printf("imrectangle failed: %s\n", imStrError((IM_STATUS)ret));
+        // 启动编码线程
+        ctx->encoding_running = true;
+        ctx->encode_thread = std::thread(encode_thread_func, ctx);
+    }
+    
+    // 分配序列号
+    uint64_t frame_seq = ctx->frame_seq_counter++;
+    
+    // 负载均衡：尝试找到空闲的推理线程
+    int thread_count = ctx->inferences.size();
+    bool pushed = false;
+    
+    // 轮询所有推理线程
+    for(int i = 0; i < thread_count; i++) {
+        int idx = (ctx->next_inference_idx.fetch_add(1) % thread_count);
+        
+        // 检查是否空闲（原子操作，无需锁）
+        if(!ctx->inferences[idx]->is_busy()) {
+            Inference* inf = ctx->inferences[idx].get();
+            
+            // 直接访问 src_frame（因为此时 is_busy == false，推理线程不会访问）
+            dma_data_t& src_frame = inf->get_src_frame();
+            
+            int yuv_size = width_stride * height_stride * 3 / 2;
+            if(src_frame.get_size() == 0 || 
+               src_frame.width_stride != width_stride || 
+               src_frame.height_stride != height_stride) {
+                
+                // printf("Thread %d: Reallocating source frame buffer: %dx%d\n", idx, width_stride, height_stride);
+                
+                src_frame.release();
+                int ret = src_frame.make_dma(width_stride, height_stride, RK_FORMAT_YCbCr_420_SP, yuv_size, "direct_frame");
+                if(ret < 0) {
+                    printf("src_frame make_dma error\n");
+                    continue;
+                }
+            }
+            
+            // 更新帧信息
+            src_frame.width = width;
+            src_frame.height = height;
+            src_frame.width_stride = width_stride;
+            src_frame.height_stride = height_stride;
+            src_frame.format = RK_FORMAT_YCbCr_420_SP;
+            src_frame.frame_seq = frame_seq;
+
+            rga_buffer_t origin = wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
+            rga_buffer_t dst = wrapbuffer_fd(src_frame.fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
+            int ret = imcopy(origin, dst);
+            if(ret != IM_STATUS_SUCCESS) {
+                printf("imcopy1 failed: %s\n", imStrError((IM_STATUS)ret));
+                continue;
+            }
+            
+            // 触发推理（设置 is_busy = true 后，推理线程才会访问 src_frame）
+            inf->trigger_inference(frame_seq);
+            pushed = true;
+            break;
         }
     }
-
-    imcomposite(rgba, src, src);
-
-    int yuv_size = width_stride * height_stride * 3 / 2;
-    ctx->encoder->WriteData((u_char*)src_frame_buf, yuv_size);
+    
+    // 如果所有线程都忙，直接编码（保持顺序）
+    if(!pushed) {
+        printf("All inference threads busy, encoding frame %lu directly\n", frame_seq);
+        
+        auto direct_frame = std::make_shared<dma_data_t>();
+        int yuv_size = width_stride * height_stride * 3 / 2;
+        
+        if(direct_frame->make_dma(width_stride, height_stride, RK_FORMAT_YCbCr_420_SP, yuv_size, "direct_frame") == 0) {
+            direct_frame->frame_seq = frame_seq;
+            direct_frame->width = width;
+            direct_frame->height = height;
+            direct_frame->width_stride = width_stride;
+            direct_frame->height_stride = height_stride;
+            direct_frame->format = RK_FORMAT_YCbCr_420_SP;
+            
+            rga_buffer_t origin = wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
+            rga_buffer_t dst = wrapbuffer_fd(direct_frame->fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
+            auto ret = imcopy(origin, dst);
+            if(ret == IM_STATUS_SUCCESS) {
+                std::unique_lock<std::mutex> lock(ctx->pending_mutex);
+                ctx->pending_frames[frame_seq] = direct_frame;
+                lock.unlock();
+                ctx->pending_cv.notify_one();
+            }
+        }
+    }
 }
 
+
+
 void API_CALL on_track_frame_out(void *user_data, mk_frame frame) {
-    rknn_app_context_t *ctx = (rknn_app_context_t *)user_data;
-    // printf("on_track_frame_out ctx=%p\n", ctx);
+    FrameContext *ctx = (FrameContext *)user_data;
+    if(ctx == nullptr) {
+        return;
+    }
     int code = mk_frame_codec_id(frame);
     
     const char *data = mk_frame_get_data(frame);
     size_t size = mk_frame_get_data_size(frame);
+
+    uint64_t pts = mk_frame_get_pts(frame);
+    uint64_t dts = mk_frame_get_dts(frame);
+
+    // 推送原始编码流到 server_raw
+    if(server_raw != nullptr) {
+        mk_media pMedia = server_raw->getZlmMediaHandle();
+            if(pMedia != nullptr) {
+                if(code == MKCodecH264) {
+                    mk_media_input_h264(pMedia, (void*)data, size, dts, pts);
+            } else if(code == MKCodecH265) {
+                    mk_media_input_h265(pMedia, (void*)data, size, dts, pts);
+            }
+        }
+    }
+    
     if (ctx->decoder == NULL) {
         MppDecoder *decoder = new MppDecoder();
-    
         MppCodingType video_type = ConvertCodecType(code);
         if (video_type == MPP_VIDEO_CodingUnused) {
             fprintf(stderr, "Unsupported codec type: %d\n", code);
@@ -201,7 +322,7 @@ void API_CALL on_track_frame_out(void *user_data, mk_frame frame) {
             return;
         }
         
-        if (decoder->Init(video_type, 30, ctx) != 1) {
+        if (decoder->Init(video_type, ctx->fps, ctx) != 1) {
             fprintf(stderr, "Failed to initialize decoder\n");
             delete decoder;
             return;
@@ -212,36 +333,37 @@ void API_CALL on_track_frame_out(void *user_data, mk_frame frame) {
     ctx->decoder->Decode((uint8_t *)data, size, 0);
 }
 
-void API_CALL on_mk_play_event_func(void *user_data, int err_code, const char *err_msg, mk_track tracks[],
-                                    int track_count)
+void API_CALL on_mk_play_event_func(void *user_data, int err_code, const char *err_msg, 
+                                    mk_track tracks[], int track_count)
 {
-    rknn_app_context_t *ctx = (rknn_app_context_t *)user_data;
     if (err_code == 0) {
-        // success
-        printf("play success!");
-        int i;
-        for (i = 0; i < track_count; ++i) {
+        printf("play success!\n");
+        for (int i = 0; i < track_count; ++i) {
             if (mk_track_is_video(tracks[i])) {
                 log_info("got video track: %s", mk_track_codec_name(tracks[i]));
-                // 监听track数据回调
                 mk_track_add_delegate(tracks[i], on_track_frame_out, user_data);
-            }   
+                auto ptr = (FrameContext*)user_data;
+                if(ptr != nullptr) {
+                    ptr->fps = mk_track_video_fps(tracks[i]);
+                }
+            }
         }
-    }
-    else {
-        printf("play failed: %d %s", err_code, err_msg);
+    } else {
+        printf("play failed: %d %s\n", err_code, err_msg);
     }
 }
 
-void API_CALL on_mk_shutdown_func(void *user_data, int err_code, const char *err_msg, mk_track tracks[], int track_count) {
-    printf("play interrupted: %d %s", err_code, err_msg);
+void API_CALL on_mk_shutdown_func(void *user_data, int err_code, const char *err_msg, 
+                                  mk_track tracks[], int track_count) {
+    printf("play interrupted: %d %s\n", err_code, err_msg);
 }
 
-int process_video_rtsp(rknn_app_context_t *ctx, const char *url) {
+int process_video_rtsp(FrameContext *ctx, const char *url) {
     mk_config config;
     memset(&config, 0, sizeof(mk_config));
     config.log_mask = LOG_CONSOLE;
     mk_env_init(&config);
+    
     mk_player player = mk_player_create();
     mk_player_set_on_result(player, on_mk_play_event_func, ctx);
     mk_player_set_on_shutdown(player, on_mk_shutdown_func, ctx);
@@ -257,38 +379,62 @@ int process_video_rtsp(rknn_app_context_t *ctx, const char *url) {
 }
 
 int main(int argc, char **argv) {
-    
-    rknn_app_context_t app_ctx;
     Config config = loadConfig("config.ini");
-    const char *model_path = "./model/yolov8n.rknn";
-    int ret = initialize(model_path, &app_ctx);
-    if(ret != 0) {
-        printf("initialize inference error ret=%d\n", ret);
-        return 1;
-    }
 
     init_post_process();
-
-    server = std::make_unique<RtspServer>(config.pushServer);
-    server->initServer();
-    server->initZlmMedia();
-
-    process_video_rtsp(&app_ctx, config.pullStream.c_str());
-
-    if (app_ctx.decoder != nullptr) {
-        delete (app_ctx.decoder);
-        app_ctx.decoder = nullptr;
+    
+    FrameContext frame_ctx;
+    
+    // 创建多个推理实例，并设置编码回调
+    for(int i = 0; i < config.inference_threads; i++) {
+        auto inference = std::make_unique<Inference>();
+        int ret = inference->initialize(config.model_path.c_str(), i == 0 ? true : false);
+        if(ret != 0) {
+            printf("initialize inference %d error ret=%d\n", i, ret);
+            return 1;
+        }
+        
+        // 设置编码回调
+        inference->set_encode_callback([&frame_ctx](std::shared_ptr<dma_data_t> frame) {
+            inference_encode_callback(&frame_ctx, frame);
+        });
+        
+        frame_ctx.inferences.push_back(std::move(inference));
+        // printf("Inference thread %d initialized\n", i);
     }
-    if (app_ctx.encoder != nullptr) {
-        delete (app_ctx.encoder);
-        app_ctx.encoder = nullptr;
+
+    PushServer m_server_config = config.pushServer;
+
+    m_server_config.stream_conifg = config.detectStream;
+    server_detect = std::make_unique<RtspServer>(m_server_config);
+    server_detect->initZlmMedia();
+
+    m_server_config.stream_conifg = config.originStream;
+    server_raw = std::make_unique<RtspServer>(m_server_config);
+    server_raw->initZlmMedia();
+
+    process_video_rtsp(&frame_ctx, config.pullStream.c_str());
+
+    // 清理资源
+    frame_ctx.encoding_running = false;
+    frame_ctx.pending_cv.notify_all();
+    
+    if(frame_ctx.encode_thread.joinable()) {
+        frame_ctx.encode_thread.join();
     }
 
-    deinit_post_process();
+    if (frame_ctx.decoder != nullptr) {
+        delete frame_ctx.decoder;
+        frame_ctx.decoder = nullptr;
+    }
+    if (frame_ctx.encoder != nullptr) {
+        delete frame_ctx.encoder;
+        frame_ctx.encoder = nullptr;
+    }
 
-    server->stopServer();
-
-    release(&app_ctx);
+    frame_ctx.inferences.clear();
+    server_detect->stopServer();
+    server_raw->stopServer();
 
     return 0;
 }

@@ -8,19 +8,25 @@
 #include <unistd.h>
 #include <sys/time.h>
 
+#include <map>
+#include <atomic>
 #include <vector>
+#include <memory>
+#include <condition_variable>
 
-#include "im2d.h"
-#include "im2d_type.h"
 #include "rga.h"
-#include "RgaUtils.h"
-
+#include "im2d.h"
 #include "rknn_api.h"
+#include "RgaUtils.h"
+#include "dma_alloc.h"
+#include "im2d_type.h"
 
 #include "mpp_decoder.h"
 #include "encode_video.h"
 
 #define CMA_HEAP_PATH "/dev/dma_heap/cma"
+
+class Inference;
 
 typedef struct
 {
@@ -31,15 +37,6 @@ typedef struct
     int model_channel;
     int model_width;
     int model_height;
-    MppDecoder *decoder = nullptr;
-    RKEncodeVideo *encoder= nullptr;
-
-    int resize_dma_fd;
-    char *resize_buf = nullptr;
-    int dst_dma_fd;
-    char *dst_buf = nullptr;
-    rga_buffer_handle_t resize_handle;
-    rga_buffer_handle_t dst_handle;
     bool is_quant;
 } rknn_app_context_t;
 
@@ -116,5 +113,100 @@ typedef struct _BOX_RECT {
     int top;
     int bottom;
 } BOX_RECT;
+
+struct dma_data_t {
+    int width;
+    int height;
+    int width_stride;
+    int height_stride;
+    int format;
+    int size;
+    int fd = 0;
+    char *buf = nullptr;
+    uint64_t frame_seq = 0;
+
+    dma_data_t() = default;
+    dma_data_t(const dma_data_t&) = delete;
+    dma_data_t& operator=(const dma_data_t&) = delete;
+
+    ~dma_data_t() {
+        if(buf != nullptr) {
+            dma_buf_free(get_size(), &fd, buf);
+        }
+    }
+
+    int make_dma(int width, int height, int format, int size, char* name) {
+        printf("make_dma: %s\n", name);
+        this->width = width;
+        this->height = height;
+        this->format = format;
+        this->size = size;
+        int ret = dma_buf_alloc(CMA_HEAP_PATH, size, &fd, (void **)&buf);
+        if (ret < 0 || fd <= 0 || buf == NULL) {
+            printf("dma_buf_alloc failed: ret=%d, fd=%d, buf=%p\n", ret, fd, buf);
+            return -1;
+        }
+        return 0;
+    }
+
+    void release() {
+        if(buf != nullptr) {
+            dma_buf_free(get_size(), &fd, buf);
+            buf = nullptr;
+            fd = 0;
+            size = 0;
+        }
+    }
+
+    int get_size() {
+        if(buf != nullptr) {
+            return size;
+        }
+        else {
+            return 0;
+        }
+    }
+};
+
+struct StreamConfig {
+    std::string vhost;
+    std::string app;
+    std::string stream;
+};
+
+struct PushServer {
+    std::string type = "rtsp";
+    int port = 8554;
+    StreamConfig stream_conifg;  // 原始流
+};
+
+struct Config {
+    PushServer pushServer;
+    StreamConfig originStream;  // 原始流
+    StreamConfig detectStream;  // 检测流
+    std::string pullStream;
+    std::string model_path;
+    int inference_threads = 2; // 推理线程数量
+};
+
+struct FrameContext {
+    int fps = 30; // 视频流的fps
+
+    std::vector<std::unique_ptr<Inference>> inferences; // 多个推理实例
+    RKEncodeVideo *encoder = nullptr;
+    MppDecoder *decoder = nullptr;
+    
+    std::atomic<uint64_t> frame_seq_counter{0}; // 帧序列号计数器
+    std::atomic<uint64_t> encode_seq{0}; // 当前应该编码的序列号
+    
+    std::map<uint64_t, std::shared_ptr<dma_data_t>> pending_frames; // 等待编码的帧
+    std::mutex pending_mutex;
+    std::condition_variable pending_cv;
+    
+    std::thread encode_thread;
+    std::atomic<bool> encoding_running{false};
+    
+    std::atomic<int> next_inference_idx{0}; // 轮询索引
+};
 
 #endif

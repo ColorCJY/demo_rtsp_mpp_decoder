@@ -6,6 +6,24 @@ url = rtsp://ip:port/app/stream
 [push_server]
 type = rtsp
 port = 8554
+
+# 两个stream的配置不能完全相同
+# origin_stream配置
+[origin_stream]
 vhost = __defaultVhost__
 app = app
-stream = stream
+stream = origin
+
+# detect_stream配置
+[detect_stream]
+vhost = __defaultVhost__
+app = app
+stream = detect
+
+# 模型路径
+[model_path]
+path = ./model/yolov8n.rknn
+
+# 推理线程数量
+[inference]
+threads=3

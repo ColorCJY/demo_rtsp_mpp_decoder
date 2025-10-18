@@ -6,7 +6,7 @@ set(CMAKE_CXX_COMPILER /usr/bin/aarch64-linux-gnu-g++)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Release)
-# set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -Wall -O2 -pthread")
+set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -Wall -O3")
 
 # RK3588 MPP 库路径
 set(MPP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/mpp/include")
@@ -20,8 +20,6 @@ set(RKNN_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/rknn/lib")
 
 set(ZLMEDIAKIT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/zlmediakit/include")
 set(ZLMEDIAKI_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/zlmediakit/aarch64")
-
-link_directories("/home/dev/thirdparty24/ffmpeg_libs")
 
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
@@ -48,6 +46,7 @@ set(SOURCES
     src/rtsp_server.cpp
     src/INIReader.cpp
     src/ini.c
+    src/inference.cpp
 )
 
 add_executable(rtsp_mpp_decoder ${SOURCES})
@@ -69,6 +68,7 @@ install(DIRECTORY ${MPP_LIB_DIR}/
     DESTINATION lib
     FILES_MATCHING PATTERN "librockchip_mpp.so*"
     PATTERN "*.a" EXCLUDE
+    PATTERN "pkgconfig" EXCLUDE  # 排除 pkgconfig 目录
 )
 install(FILES ${RKNN_LIB_DIR}/librknnrt.so DESTINATION lib)
 install(FILES ${RGA_LIB_DIR}/librga.so DESTINATION lib)

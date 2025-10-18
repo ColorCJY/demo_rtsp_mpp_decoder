@@ -14,7 +14,9 @@
 
 4.[librga](https://github.com/airockchip/librga)
 
-5.[模型下载](https://github.com/airockchip/rknn_model_zoo/blob/main/examples/yolov8/README.md)
+5.[inih](https://github.com/benhoyt/inih)
+
+6.[模型转换与下载](https://github.com/airockchip/rknn_model_zoo/blob/main/examples/yolov8/README.md)
 
 ## Useage
 ```
@@ -41,3 +43,4 @@ tar -zcvf rtsp_mpp_decoder.tar.gz rtsp_mpp_decoder
 ./rtsp_mpp_decoder.sh
 ```
 
+[模型备份 提取码：CcaU](https://pan.quark.cn/s/c1f84ff25776)

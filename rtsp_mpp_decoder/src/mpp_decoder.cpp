@@ -176,7 +176,7 @@ int MppDecoder::Decode(uint8_t* pkt_data, int pkt_size, int pkt_eos) {
 
                 if (mpp_frame_get_info_change(frame)) {
 
-                    LOGD("decode_get_frame get info changed found ");
+                    // LOGD("decode_get_frame get info changed found ");
                     if (NULL == data->frm_grp) {
                         /* If buffer group is not set create one and limit it */
                         ret = mpp_buffer_group_get_internal(&data->frm_grp, MPP_BUFFER_TYPE_DRM);

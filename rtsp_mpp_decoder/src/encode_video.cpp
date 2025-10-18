@@ -442,7 +442,7 @@ int RKEncodeVideo::Initencoder(InputInfo& encoderinfo, int srcindex, PacketCallb
     m_frame_info.width = encoderinfo.width;
     m_frame_info.format = encoderinfo.format;
     m_stream_info.StreamType = 0;
-    m_stream_info.gop = 60;
+    m_stream_info.gop = encoderinfo.fps * 2;
     m_put_num = 0;
     m_encode_num = 0;
     InitMppEnc();
