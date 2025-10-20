@@ -123,12 +123,10 @@ void deal_coded_frame(uint8_t* data, uint32_t size, uint64_t pts, void* userdata
 }
 
 // 编码回调函数（从推理线程调用）
-void inference_encode_callback(FrameContext* ctx, std::shared_ptr<dma_data_t> frame) {
+void inference_encode_callback(FrameContext* ctx, std::shared_ptr<code_frame_t> frame) {
     std::unique_lock<std::mutex> lock(ctx->pending_mutex);
-    
     // 将处理完的帧加入待编码队列
     ctx->pending_frames[frame->frame_seq] = frame;
-    
     lock.unlock();
     ctx->pending_cv.notify_one();
 }
@@ -136,11 +134,10 @@ void inference_encode_callback(FrameContext* ctx, std::shared_ptr<dma_data_t> fr
 // 编码线程函数 - 按序编码
 void encode_thread_func(FrameContext* ctx) {
     while(ctx->encoding_running) {
-        std::shared_ptr<dma_data_t> frame_to_encode;
+        std::shared_ptr<code_frame_t> frame_to_encode;
         
         {
             std::unique_lock<std::mutex> lock(ctx->pending_mutex);
-            
             // 等待有数据或退出信号
             ctx->pending_cv.wait(lock, [ctx]() {
                 return !ctx->pending_frames.empty() || !ctx->encoding_running;
@@ -165,9 +162,10 @@ void encode_thread_func(FrameContext* ctx) {
         }
         
         // 编码帧
-        if(frame_to_encode && ctx->encoder != nullptr) {
-            ctx->encoder->WriteData((u_char*)frame_to_encode->buf, frame_to_encode->size);
+        if(frame_to_encode && frame_to_encode->frame && ctx->encoder != nullptr) {
+            ctx->encoder->WriteData(frame_to_encode->frame, frame_to_encode->size);
         }
+        // shared_ptr 自动释放，不需要手动 free
     }
 }
 
@@ -228,7 +226,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
                 // printf("Thread %d: Reallocating source frame buffer: %dx%d\n", idx, width_stride, height_stride);
                 
                 src_frame.release();
-                int ret = src_frame.make_dma(width_stride, height_stride, RK_FORMAT_YCbCr_420_SP, yuv_size, "direct_frame");
+                int ret = src_frame.make_dma(width_stride, height_stride, RK_FORMAT_YCbCr_420_SP, yuv_size);
                 if(ret < 0) {
                     printf("src_frame make_dma error\n");
                     continue;
@@ -242,14 +240,8 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
             src_frame.height_stride = height_stride;
             src_frame.format = RK_FORMAT_YCbCr_420_SP;
             src_frame.frame_seq = frame_seq;
-
-            rga_buffer_t origin = wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-            rga_buffer_t dst = wrapbuffer_fd(src_frame.fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-            int ret = imcopy(origin, dst);
-            if(ret != IM_STATUS_SUCCESS) {
-                printf("imcopy1 failed: %s\n", imStrError((IM_STATUS)ret));
-                continue;
-            }
+            
+            memcpy(src_frame.buf, data, yuv_size);
             
             // 触发推理（设置 is_busy = true 后，推理线程才会访问 src_frame）
             inf->trigger_inference(frame_seq);
@@ -261,28 +253,18 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
     // 如果所有线程都忙，直接编码（保持顺序）
     if(!pushed) {
         printf("All inference threads busy, encoding frame %lu directly\n", frame_seq);
-        
-        auto direct_frame = std::make_shared<dma_data_t>();
         int yuv_size = width_stride * height_stride * 3 / 2;
-        
-        if(direct_frame->make_dma(width_stride, height_stride, RK_FORMAT_YCbCr_420_SP, yuv_size, "direct_frame") == 0) {
-            direct_frame->frame_seq = frame_seq;
-            direct_frame->width = width;
-            direct_frame->height = height;
-            direct_frame->width_stride = width_stride;
-            direct_frame->height_stride = height_stride;
-            direct_frame->format = RK_FORMAT_YCbCr_420_SP;
+    
+        auto direct_frame = std::make_shared<code_frame_t>();
+        direct_frame->frame_seq = frame_seq;
+        direct_frame->size = yuv_size;
+        direct_frame->frame = (u_char*)malloc(yuv_size);
             
-            rga_buffer_t origin = wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-            rga_buffer_t dst = wrapbuffer_fd(direct_frame->fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-            auto ret = imcopy(origin, dst);
-            if(ret == IM_STATUS_SUCCESS) {
-                std::unique_lock<std::mutex> lock(ctx->pending_mutex);
-                ctx->pending_frames[frame_seq] = direct_frame;
-                lock.unlock();
-                ctx->pending_cv.notify_one();
-            }
-        }
+        memcpy(direct_frame->frame, data, yuv_size);
+        std::unique_lock<std::mutex> lock(ctx->pending_mutex);
+        ctx->pending_frames[frame_seq] = direct_frame;
+        lock.unlock();
+        ctx->pending_cv.notify_one();
     }
 }
 
@@ -381,21 +363,42 @@ int process_video_rtsp(FrameContext *ctx, const char *url) {
 int main(int argc, char **argv) {
     Config config = loadConfig("config.ini");
 
-    init_post_process();
+    int ret = init_post_process();
+    if(ret < 0) {
+        return ret;
+    }
     
+    // 1. 创建渲染器
+    YUVLabelRenderer renderer;
+    YUVLabelRenderer::Config font_config;
+    font_config.font_size = 18;
+    font_config.font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+    font_config.font_color_r = 255;
+    font_config.font_color_g = 255;
+    font_config.font_color_b = 0;  // 黄色字体
+    font_config.bg_color_r = 0;
+    font_config.bg_color_g = 0;
+    font_config.bg_color_b = 0;
+    font_config.bg_alpha = 255;  // 更不透明的背景
+    extern char* labels[OBJ_CLASS_NUM];
+    ret = renderer.initialize(labels, font_config);
+    if(!ret) {
+        return -2;
+    }
+    // renderer.setDefaultBackgroundColor(LabelRenderer::Color(255, 0, 0, 180));
+
     FrameContext frame_ctx;
-    
     // 创建多个推理实例，并设置编码回调
     for(int i = 0; i < config.inference_threads; i++) {
         auto inference = std::make_unique<Inference>();
-        int ret = inference->initialize(config.model_path.c_str(), i == 0 ? true : false);
+        ret = inference->initialize(config.model_path.c_str(), i == 0 ? true : false, &renderer);
         if(ret != 0) {
             printf("initialize inference %d error ret=%d\n", i, ret);
             return 1;
         }
         
         // 设置编码回调
-        inference->set_encode_callback([&frame_ctx](std::shared_ptr<dma_data_t> frame) {
+        inference->set_encode_callback([&frame_ctx](std::shared_ptr<code_frame_t> frame) {
             inference_encode_callback(&frame_ctx, frame);
         });
         
@@ -414,6 +417,9 @@ int main(int argc, char **argv) {
     server_raw->initZlmMedia();
 
     process_video_rtsp(&frame_ctx, config.pullStream.c_str());
+    renderer.cleanup();
+
+    deinit_post_process();
 
     // 清理资源
     frame_ctx.encoding_running = false;

@@ -122,7 +122,7 @@ struct dma_data_t {
     int format;
     int size;
     int fd = 0;
-    char *buf = nullptr;
+    u_char *buf = nullptr;
     uint64_t frame_seq = 0;
 
     dma_data_t() = default;
@@ -135,8 +135,7 @@ struct dma_data_t {
         }
     }
 
-    int make_dma(int width, int height, int format, int size, char* name) {
-        printf("make_dma: %s\n", name);
+    int make_dma(int width, int height, int format, int size) {
         this->width = width;
         this->height = height;
         this->format = format;
@@ -167,6 +166,52 @@ struct dma_data_t {
         }
     }
 };
+
+struct code_frame_t {
+    u_char* frame = nullptr;  // 手动管理的指针
+    int size = 0;
+    uint64_t frame_seq = 0;   // 序列号
+    
+    // 析构函数 - 自动释放 malloc 的内存
+    ~code_frame_t() {
+        if(frame) {
+            free(frame);
+            frame = nullptr;
+        }
+    }
+    
+    // 禁止拷贝（避免浅拷贝导致double free）
+    code_frame_t(const code_frame_t&) = delete;
+    code_frame_t& operator=(const code_frame_t&) = delete;
+    
+    // 允许移动
+    code_frame_t(code_frame_t&& other) noexcept 
+        : frame(other.frame), size(other.size), frame_seq(other.frame_seq) {
+        other.frame = nullptr;
+        other.size = 0;
+    }
+    
+    code_frame_t& operator=(code_frame_t&& other) noexcept {
+        if(this != &other) {
+            // 释放当前资源
+            if(frame) {
+                free(frame);
+            }
+            // 转移所有权
+            frame = other.frame;
+            size = other.size;
+            frame_seq = other.frame_seq;
+            
+            other.frame = nullptr;
+            other.size = 0;
+        }
+        return *this;
+    }
+    
+    // 默认构造函数
+    code_frame_t() = default;
+};
+
 
 struct StreamConfig {
     std::string vhost;
@@ -199,7 +244,7 @@ struct FrameContext {
     std::atomic<uint64_t> frame_seq_counter{0}; // 帧序列号计数器
     std::atomic<uint64_t> encode_seq{0}; // 当前应该编码的序列号
     
-    std::map<uint64_t, std::shared_ptr<dma_data_t>> pending_frames; // 等待编码的帧
+    std::map<uint64_t, std::shared_ptr<code_frame_t>> pending_frames; // 等待编码的帧
     std::mutex pending_mutex;
     std::condition_variable pending_cv;
     

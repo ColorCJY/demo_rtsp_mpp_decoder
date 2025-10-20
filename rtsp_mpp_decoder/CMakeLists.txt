@@ -21,12 +21,16 @@ set(RKNN_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/rknn/lib")
 set(ZLMEDIAKIT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/zlmediakit/include")
 set(ZLMEDIAKI_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/zlmediakit/aarch64")
 
+set(FREETYPE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/freetype/include/freetype2")
+set(FREETYPE_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/freetype/lib")
+
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
     ${ZLMEDIAKIT_INCLUDE_DIR}
     ${MPP_INCLUDE_DIR}
     ${RGA_INCLUDE_DIR}
     ${RKNN_INCLUDE_DIR}
+    ${FREETYPE_INCLUDE_DIR}
 )
 
 link_directories(
@@ -34,6 +38,7 @@ link_directories(
     ${MPP_LIB_DIR}
     ${RKNN_LIB_DIR}
     ${RGA_LIB_DIR}
+    ${FREETYPE_LIB_DIR}
 )
 
 # 源文件
@@ -47,6 +52,7 @@ set(SOURCES
     src/INIReader.cpp
     src/ini.c
     src/inference.cpp
+    src/label_render.cpp
 )
 
 add_executable(rtsp_mpp_decoder ${SOURCES})
@@ -57,6 +63,7 @@ target_link_libraries(rtsp_mpp_decoder
     rga
     mk_api
     pthread
+    libfreetype.a
 )
 
 # 安装

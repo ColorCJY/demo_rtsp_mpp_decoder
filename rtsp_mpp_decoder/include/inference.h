@@ -4,20 +4,21 @@
 #include <thread>
 #include <functional>
 
+#include "label_render.h"
 #include "rknn_api.h"
 #include "rknn_type.h"
 #include "dma_alloc.h"
 #include "postprocess.h"
 
 // 编码回调函数类型
-using EncodeCallback = std::function<void(std::shared_ptr<dma_data_t>)>;
+using EncodeCallback = std::function<void(std::shared_ptr<code_frame_t>)>;
 
 class Inference {
 public:
     ~Inference() {
         release();
     }
-    int initialize(const char *model_path, bool info);
+    int initialize(const char *model_path, bool info, YUVLabelRenderer* ptr);
     
     // 获取源帧缓冲区的引用（用于外部直接复制）
     dma_data_t& get_src_frame() { return src_frame; }
@@ -51,7 +52,13 @@ private:
     dma_data_t rgba_data;
     dma_data_t src_frame; // 源帧缓冲区（对外暴露）
 
+    rga_buffer_t src;
+    rga_buffer_t dst;
+    rga_buffer_t resize;
+    rga_buffer_t rgba;
+
     rknn_app_context_t app_ctx;
+    YUVLabelRenderer* m_lanbelRenderer = nullptr;
 
     uint64_t m_current_frame_seq = 0;
     bool m_has_frame = false;

@@ -17,7 +17,7 @@
 #include <set>
 #define LABEL_NALE_TXT_PATH "./model/coco_80_labels_list.txt"
 
-static char *labels[OBJ_CLASS_NUM];
+char *labels[OBJ_CLASS_NUM];
 
 inline static int clamp(float val, int min, int max) { return val > min ? (val < max ? val : max) : min; }
 
