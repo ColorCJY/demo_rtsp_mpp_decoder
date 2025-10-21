@@ -1,12 +1,16 @@
 #include "label_render.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-// ==================== 构造和析构 ====================
+#include <chrono>
+#include <algorithm>
 
 YUVLabelRenderer::YUVLabelRenderer() 
     : initialized_(false)
     , ft_library_(nullptr)
     , ft_face_(nullptr)
+    , frame_count_(0)
+    , last_fps_time_ms_(0)
+    , current_fps_(0.0f)
 {
     for (int i = 0; i < OBJ_CLASS_NUM; i++) {
         labels_[i] = nullptr;
@@ -17,10 +21,10 @@ YUVLabelRenderer::~YUVLabelRenderer() {
     cleanup();
 }
 
-// ==================== 公共方法 ====================
-
 bool YUVLabelRenderer::initialize(char* labels[OBJ_CLASS_NUM], const Config& config) {
-    if (initialized_) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    
+    if (initialized_.load()) {
         cleanup();
     }
     
@@ -39,15 +43,17 @@ bool YUVLabelRenderer::initialize(char* labels[OBJ_CLASS_NUM], const Config& con
         return false;
     }
     
-    initialized_ = true;
+    initialized_.store(true);
     printf("YUVLabelRenderer initialized successfully\n");
     return true;
 }
 
 bool YUVLabelRenderer::updateConfig(const Config& new_config) {
-    if (!initialized_) {
+    if (!initialized_.load()) {
         return false;
     }
+    
+    std::lock_guard<std::mutex> lock(config_mutex_);
     
     bool need_regenerate = false;
     
@@ -77,19 +83,21 @@ bool YUVLabelRenderer::updateConfig(const Config& new_config) {
 }
 
 bool YUVLabelRenderer::setFontSize(int size) {
-    if (!initialized_ || size <= 0) {
+    if (!initialized_.load() || size <= 0) {
         return false;
     }
     
+    std::lock_guard<std::mutex> lock(config_mutex_);
     config_.font_size = size;
     return regenerateAllLabels();
 }
 
 bool YUVLabelRenderer::setFontPath(const std::string& path) {
-    if (!initialized_) {
+    if (!initialized_.load()) {
         return false;
     }
     
+    std::lock_guard<std::mutex> lock(config_mutex_);
     cleanupFreeType();
     config_.font_path = path;
     
@@ -101,10 +109,11 @@ bool YUVLabelRenderer::setFontPath(const std::string& path) {
 }
 
 bool YUVLabelRenderer::setFontColor(uint8_t r, uint8_t g, uint8_t b) {
-    if (!initialized_) {
+    if (!initialized_.load()) {
         return false;
     }
     
+    std::lock_guard<std::mutex> lock(config_mutex_);
     config_.font_color_r = r;
     config_.font_color_g = g;
     config_.font_color_b = b;
@@ -113,6 +122,7 @@ bool YUVLabelRenderer::setFontColor(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void YUVLabelRenderer::setBackgroundColor(uint8_t r, uint8_t g, uint8_t b, uint8_t alpha) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
     config_.bg_color_r = r;
     config_.bg_color_g = g;
     config_.bg_color_b = b;
@@ -120,6 +130,7 @@ void YUVLabelRenderer::setBackgroundColor(uint8_t r, uint8_t g, uint8_t b, uint8
 }
 
 void YUVLabelRenderer::setBoxColor(uint8_t r, uint8_t g, uint8_t b) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
     config_.box_color_r = r;
     config_.box_color_g = g;
     config_.box_color_b = b;
@@ -127,105 +138,58 @@ void YUVLabelRenderer::setBoxColor(uint8_t r, uint8_t g, uint8_t b) {
 
 void YUVLabelRenderer::setBoxThickness(int thickness) {
     if (thickness > 0) {
+        std::lock_guard<std::mutex> lock(config_mutex_);
         config_.box_thickness = thickness;
     }
 }
 
-void saveYUV420SPAsPNG(const uint8_t* yuv420sp, int w, int h, 
-                                         bool is_nv21, const std::string& filename) {
-    std::vector<uint8_t> rgba(w * h * 4);
-    const uint8_t* Y = yuv420sp;
-    const uint8_t* UV = yuv420sp + w * h;
-    
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            int y_idx = y * w + x;
-            int uv_y = y / 2;
-            int uv_x = x / 2;
-            int uv_idx = uv_y * w + uv_x * 2;
-            
-            uint8_t Y_val = Y[y_idx];
-            uint8_t U_val = is_nv21 ? UV[uv_idx + 1] : UV[uv_idx + 0];
-            uint8_t V_val = is_nv21 ? UV[uv_idx + 0] : UV[uv_idx + 1];
-            
-            // YUV to RGB
-            int C = Y_val - 16;
-            int D = U_val - 128;
-            int E = V_val - 128;
-            
-            int R = (298 * C + 409 * E + 128) >> 8;
-            int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
-            int B = (298 * C + 516 * D + 128) >> 8;
-            
-            int idx = (y * w + x) * 4;
-            rgba[idx + 0] = std::max(0, std::min(255, R));
-            rgba[idx + 1] = std::max(0, std::min(255, G));
-            rgba[idx + 2] = std::max(0, std::min(255, B));
-            rgba[idx + 3] = 255;
-        }
-    }
-    
-    stbi_write_png(filename.c_str(), w, h, 4, rgba.data(), w * 4);
-}
-
-
-// YUV420SP格式接口 (推荐使用)
 void YUVLabelRenderer::drawDetection(uint8_t* yuv420sp,
                                     int frame_width, int frame_height,
                                     int class_id, float confidence,
                                     int box_x, int box_y,
                                     bool is_nv21) {
-    if (!initialized_ || class_id < 0 || class_id >= OBJ_CLASS_NUM) {
+    if (!initialized_.load() || class_id < 0 || class_id >= OBJ_CLASS_NUM) {
         return;
     }
 
-    // 2. 生成置信度文本
+    std::lock_guard<std::mutex> lock(render_mutex_);
+
     char conf_text[32];
     snprintf(conf_text, sizeof(conf_text), ": %.1f%%", confidence * 100.0f);
     TextImageRGBA conf_img = generateTextImage(conf_text);
 
-    // 3. 获取类别标签
     const TextImageRGBA& label_img = label_images_[class_id];
     if (label_img.data.empty()) {
         return;
     }
 
-    // 4. 计算总尺寸
     int total_width = label_img.width + conf_img.width;
     int total_height = std::max(label_img.height, conf_img.height);
 
-    // 5. 确定文本位置
     int text_x = box_x;
     int text_y = box_y - total_height - 6;
     if (text_y < 0) {
         text_y = box_y + 2;
     }
 
-    // 背景区域
     fillRectYUV420SP(yuv420sp, frame_width, frame_height,
-                 text_x - 2, text_y - 2,
-                 total_width + 4, total_height + 4,
-                 config_.bg_color_r, config_.bg_color_g, config_.bg_color_b,
-                 config_.bg_alpha, is_nv21);
+                     text_x - 2, text_y - 2,
+                     total_width + 4, total_height + 4,
+                     config_.bg_color_r, config_.bg_color_g, config_.bg_color_b,
+                     config_.bg_alpha, is_nv21);
 
-    // 7. 绘制类别标签
     blitRgbaToYUV420SP(yuv420sp, frame_width, frame_height,
                        label_img, text_x, text_y, is_nv21);
 
-    // 8. 绘制置信度
     blitRgbaToYUV420SP(yuv420sp, frame_width, frame_height,
                        conf_img, text_x + label_img.width, text_y, is_nv21);
-
-    // saveYUV420SPAsPNG(yuv420sp, frame_width, frame_height, false, "result.png");
 }
 
-// 兼容旧接口 (分离的Y和UV平面)
 void YUVLabelRenderer::drawDetection(uint8_t* y_plane, uint8_t* uv_plane,
                                     int frame_width, int frame_height,
                                     int class_id, float confidence,
                                     int box_x, int box_y,
                                     bool is_nv21) {
-    // 假设UV平面紧跟在Y平面之后
     if (uv_plane == y_plane + frame_width * frame_height) {
         drawDetection(y_plane, frame_width, frame_height,
                      class_id, confidence, box_x, box_y, is_nv21);
@@ -235,6 +199,8 @@ void YUVLabelRenderer::drawDetection(uint8_t* y_plane, uint8_t* uv_plane,
 }
 
 void YUVLabelRenderer::cleanup() {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    
     for (int i = 0; i < OBJ_CLASS_NUM; i++) {
         label_images_[i].data.clear();
         label_images_[i].width = 0;
@@ -243,10 +209,8 @@ void YUVLabelRenderer::cleanup() {
     }
     
     cleanupFreeType();
-    initialized_ = false;
+    initialized_.store(false);
 }
-
-// ==================== 私有方法 ====================
 
 YUVLabelRenderer::YUVColor YUVLabelRenderer::rgbToYuv(uint8_t r, uint8_t g, uint8_t b) {
     YUVColor yuv;
@@ -290,6 +254,8 @@ YUVLabelRenderer::TextImageRGBA YUVLabelRenderer::generateTextImage(const char* 
     if (!ft_library_ || !ft_face_ || !text || strlen(text) == 0) {
         return result;
     }
+    
+    std::lock_guard<std::mutex> lock(freetype_mutex_);
     
     FT_Set_Pixel_Sizes(ft_face_, 0, config_.font_size);
     
@@ -367,13 +333,51 @@ bool YUVLabelRenderer::regenerateAllLabels() {
             printf("Failed to generate image for label: %s\n", labels_[i]);
             continue;
         }
-        
-        printf("Generated: [%d] %s (%dx%d)\n", i, labels_[i],
-               label_images_[i].width, label_images_[i].height);
     }
     
     printf("Label atlas regenerated\n");
     return true;
+}
+
+float YUVLabelRenderer::calculateFPS() {
+    frame_count_.fetch_add(1, std::memory_order_relaxed);
+    
+    auto now = std::chrono::steady_clock::now();
+    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count();
+    
+    int64_t last_time = last_fps_time_ms_.load(std::memory_order_relaxed);
+    int64_t elapsed = now_ms - last_time;
+    
+    if (elapsed >= 1000) {
+        int frames = frame_count_.exchange(0, std::memory_order_relaxed);
+        float fps = frames * 1000.0f / elapsed;
+        current_fps_.store(fps, std::memory_order_relaxed);
+        last_fps_time_ms_.store(now_ms, std::memory_order_relaxed);
+    }
+    
+    return current_fps_.load(std::memory_order_relaxed);
+}
+
+void YUVLabelRenderer::drawFPS(uint8_t* yuv420sp, int frame_width, int frame_height,
+                               int x, int y, bool is_nv21) {
+    if (!initialized_.load()) return;
+    
+    std::lock_guard<std::mutex> lock(render_mutex_);
+    
+    float fps = calculateFPS();
+    char fps_text[32];
+    snprintf(fps_text, sizeof(fps_text), "FPS: %.1f", fps);
+    
+    TextImageRGBA fps_img = generateTextImage(fps_text);
+    if (fps_img.data.empty()) return;
+    
+    fillRectYUV420SP(yuv420sp, frame_width, frame_height,
+                     x - 2, y - 2, fps_img.width + 4, fps_img.height + 4,
+                     config_.bg_color_r, config_.bg_color_g, config_.bg_color_b,
+                     config_.bg_alpha, is_nv21);
+    
+    blitRgbaToYUV420SP(yuv420sp, frame_width, frame_height, fps_img, x, y, is_nv21);
 }
 
 void YUVLabelRenderer::fillRectC1(uint8_t* pixels, int w, int h, int stride,
@@ -412,11 +416,9 @@ void YUVLabelRenderer::fillRectYUV420SP(uint8_t* yuv420sp,
                                       uint8_t alpha, bool is_nv21) {
    YUVColor color = rgbToYuv(r, g, b);
    
-   // Y平面
    uint8_t* Y = yuv420sp;
    fillRectC1(Y, w, h, w, rx, ry, rw, rh, color.y, alpha);
    
-   // UV平面
    uint8_t* UV = yuv420sp + w * h;
    
    if (is_nv21) {
@@ -457,11 +459,9 @@ void YUVLabelRenderer::blitRgbaToYUV420SP(uint8_t* yuv420sp,
            
            YUVColor yuv = rgbToYuv(r, g, b);
            
-           // 混合Y平面
            int y_idx = fy * w + fx;
            Y[y_idx] = (Y[y_idx] * (255 - alpha) + yuv.y * alpha) / 255;
            
-           // 混合UV平面 (YUV420下采样，每2x2像素共享一个UV)
            if ((fy % 2 == 0) && (fx % 2 == 0)) {
                int uv_idx = (fy / 2) * w + (fx / 2) * 2;
                if (is_nv21) {
@@ -475,4 +475,3 @@ void YUVLabelRenderer::blitRgbaToYUV420SP(uint8_t* yuv420sp,
        }
    }
 }
-

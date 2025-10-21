@@ -68,9 +68,8 @@ static unsigned char *load_model(const char *filename, int *model_size) {
     return data;
 }
 
-int Inference::initialize(const char *model_path, bool info, YUVLabelRenderer* ptr) {
+int Inference::initialize(const char *model_path, bool info) {
     int ret;
-    m_lanbelRenderer = ptr;
     memset(&app_ctx, 0, sizeof(rknn_app_context_t));
     
     int model_data_size = 0;
@@ -221,7 +220,6 @@ void Inference::inference_model() {
         int model_height = app_ctx.model_height;
         int model_channel = app_ctx.model_channel;
 
-        struct timeval start_time, stop_time;
         const float nms_threshold = NMS_THRESH;
         const float box_conf_threshold = BOX_THRESH;
 
@@ -257,7 +255,7 @@ void Inference::inference_model() {
         memset(&dst, 0, sizeof(dst));
         memset(&resize, 0, sizeof(resize));
         memset(&rgba, 0, sizeof(rgba));
-
+        
         // 检查并重新分配 RGBA 缓冲区
         if(rgba_data.get_size() == 0 || 
            rgba_data.width != src_frame.width || 
@@ -290,7 +288,6 @@ void Inference::inference_model() {
             goto CallBack;
         }
 
-        gettimeofday(&start_time, NULL);
         ret = rknn_inputs_set(ctx, app_ctx.io_num.n_input, inputs);
         if(ret < 0) {
             printf("rknn_inputs_set failed: %d\n", ret);
@@ -313,8 +310,6 @@ void Inference::inference_model() {
             printf("rknn_outputs_get failed: %d\n", ret);
             goto CallBack;
         }
-        
-        gettimeofday(&stop_time, NULL);
 
         for (int i = 0; i < app_ctx.io_num.n_output; ++i) {
             out_scales.push_back(app_ctx.output_attrs[i].scale);
@@ -336,15 +331,14 @@ void Inference::inference_model() {
             int x2 = det_result->box.right;
             int y2 = det_result->box.bottom;
 
-            if(m_lanbelRenderer != nullptr) {
-                m_lanbelRenderer->drawDetection(
-                    src_frame.buf,           // YUV420SP数据指针
-                    src_frame.width_stride, src_frame.height_stride,      // 帧尺寸
-                    det_result->cls_id,       // 类别ID
-                    det_result->prop,     // 置信度 (0.0-1.0)
-                    std::max(0, x1), std::max(0, y1)       // 边框左上角
-                );
-            }
+            
+            YUVLabelRenderer::getInstance().drawDetection(
+                src_frame.buf,           // YUV420SP数据指针
+                src_frame.width_stride, src_frame.height_stride,      // 帧尺寸
+                det_result->cls_id,       // 类别ID
+                det_result->prop,     // 置信度 (0.0-1.0)
+                std::max(0, x1), std::max(0, y1)       // 边框左上角
+            );
 
             rect[i] = {
                 std::max(0, x1),
@@ -375,6 +369,8 @@ void Inference::inference_model() {
             auto new_frame = std::make_shared<code_frame_t>();
             new_frame->frame_seq = src_frame.frame_seq;
             new_frame->size = src_frame.size;
+            new_frame->width = src_frame.width_stride;
+            new_frame->height = src_frame.height_stride;
             new_frame->frame = (u_char*)malloc(src_frame.size);
             
             if(new_frame->frame) {
@@ -387,7 +383,6 @@ void Inference::inference_model() {
             m_encode_callback(new_frame);
         }
         
-        m_is_busy.store(false);
         // 处理完成，标记为非忙碌
         m_is_busy.store(false);
     }

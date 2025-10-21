@@ -18,7 +18,7 @@ public:
     ~Inference() {
         release();
     }
-    int initialize(const char *model_path, bool info, YUVLabelRenderer* ptr);
+    int initialize(const char *model_path, bool info);
     
     // 获取源帧缓冲区的引用（用于外部直接复制）
     dma_data_t& get_src_frame() { return src_frame; }
@@ -58,7 +58,6 @@ private:
     rga_buffer_t rgba;
 
     rknn_app_context_t app_ctx;
-    YUVLabelRenderer* m_lanbelRenderer = nullptr;
 
     uint64_t m_current_frame_seq = 0;
     bool m_has_frame = false;

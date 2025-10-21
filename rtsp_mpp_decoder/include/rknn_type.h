@@ -27,6 +27,7 @@
 #define CMA_HEAP_PATH "/dev/dma_heap/cma"
 
 class Inference;
+class YUVLabelRenderer;
 
 typedef struct
 {
@@ -170,6 +171,8 @@ struct dma_data_t {
 struct code_frame_t {
     u_char* frame = nullptr;  // 手动管理的指针
     int size = 0;
+    int width;
+    int height;
     uint64_t frame_seq = 0;   // 序列号
     
     // 析构函数 - 自动释放 malloc 的内存

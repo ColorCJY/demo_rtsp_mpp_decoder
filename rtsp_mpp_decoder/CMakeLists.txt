@@ -6,7 +6,7 @@ set(CMAKE_CXX_COMPILER /usr/bin/aarch64-linux-gnu-g++)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Release)
-set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -Wall -O3")
+set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -Wall -O2")
 
 # RK3588 MPP 库路径
 set(MPP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/mpp/include")

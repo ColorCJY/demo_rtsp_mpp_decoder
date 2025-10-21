@@ -32,9 +32,9 @@ mkdir build && cd build
 
 cmake ..
 
-make install
+make -j4 install
 
-cd install
+cd ../install
 
 mv config.ini.example config.ini
 

@@ -1,6 +1,8 @@
+#include <signal.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <semaphore.h>
 
 #include <iostream>
 
@@ -9,8 +11,14 @@
 #include "inference.h"
 #include "INIReader.h"
 
+static sem_t exit_sem;
+
 std::unique_ptr<RtspServer> server_raw;
 std::unique_ptr<RtspServer> server_detect;
+
+static void sigint_handler(int sig) {
+    sem_post(&exit_sem);
+}
 
 std::vector<std::string> GetAllLocalIPs() {
     std::vector<std::string> ips;
@@ -138,7 +146,6 @@ void encode_thread_func(FrameContext* ctx) {
         
         {
             std::unique_lock<std::mutex> lock(ctx->pending_mutex);
-            // 等待有数据或退出信号
             ctx->pending_cv.wait(lock, [ctx]() {
                 return !ctx->pending_frames.empty() || !ctx->encoding_running;
             });
@@ -147,7 +154,6 @@ void encode_thread_func(FrameContext* ctx) {
                 break;
             }
             
-            // 查找当前应该编码的序列号
             uint64_t expected_seq = ctx->encode_seq.load();
             auto it = ctx->pending_frames.find(expected_seq);
             
@@ -156,16 +162,22 @@ void encode_thread_func(FrameContext* ctx) {
                 ctx->pending_frames.erase(it);
                 ctx->encode_seq++;
             } else {
-                // 序列号不匹配，继续等待
                 continue;
             }
+        }
+        
+        // 渲染FPS
+        if(frame_to_encode && frame_to_encode->frame) {
+            YUVLabelRenderer::getInstance().drawFPS(frame_to_encode->frame, 
+                                  frame_to_encode->width, 
+                                  frame_to_encode->height, 
+                                  10, 10);
         }
         
         // 编码帧
         if(frame_to_encode && frame_to_encode->frame && ctx->encoder != nullptr) {
             ctx->encoder->WriteData(frame_to_encode->frame, frame_to_encode->size);
         }
-        // shared_ptr 自动释放，不需要手动 free
     }
 }
 
@@ -259,6 +271,8 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
         direct_frame->frame_seq = frame_seq;
         direct_frame->size = yuv_size;
         direct_frame->frame = (u_char*)malloc(yuv_size);
+        direct_frame->width = width_stride;
+        direct_frame->height = height_stride;
             
         memcpy(direct_frame->frame, data, yuv_size);
         std::unique_lock<std::mutex> lock(ctx->pending_mutex);
@@ -275,7 +289,7 @@ void API_CALL on_track_frame_out(void *user_data, mk_frame frame) {
     if(ctx == nullptr) {
         return;
     }
-    int code = mk_frame_codec_id(frame);
+    int code = mk_frame_codec_id(frame);    
     
     const char *data = mk_frame_get_data(frame);
     size_t size = mk_frame_get_data_size(frame);
@@ -347,12 +361,16 @@ int process_video_rtsp(FrameContext *ctx, const char *url) {
     mk_env_init(&config);
     
     mk_player player = mk_player_create();
+    mk_player_set_option(player, "rtp_type", "tcp");
     mk_player_set_on_result(player, on_mk_play_event_func, ctx);
     mk_player_set_on_shutdown(player, on_mk_shutdown_func, ctx);
     mk_player_play(player, url);
 
-    printf("enter any key to exit\n");
-    getchar();
+    sem_init(&exit_sem, 0, 0);
+    signal(SIGINT, sigint_handler);
+    printf("Press Ctrl+C to exit\n");
+    sem_wait(&exit_sem);
+    sem_destroy(&exit_sem);
 
     if (player) {
         mk_player_release(player);
@@ -368,42 +386,36 @@ int main(int argc, char **argv) {
         return ret;
     }
     
-    // 1. 创建渲染器
-    YUVLabelRenderer renderer;
     YUVLabelRenderer::Config font_config;
     font_config.font_size = 18;
     font_config.font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
     font_config.font_color_r = 255;
     font_config.font_color_g = 255;
-    font_config.font_color_b = 0;  // 黄色字体
+    font_config.font_color_b = 0;
     font_config.bg_color_r = 0;
     font_config.bg_color_g = 0;
     font_config.bg_color_b = 0;
-    font_config.bg_alpha = 255;  // 更不透明的背景
+    font_config.bg_alpha = 255;
     extern char* labels[OBJ_CLASS_NUM];
-    ret = renderer.initialize(labels, font_config);
+    ret = YUVLabelRenderer::getInstance().initialize(labels, font_config);
     if(!ret) {
         return -2;
     }
-    // renderer.setDefaultBackgroundColor(LabelRenderer::Color(255, 0, 0, 180));
 
     FrameContext frame_ctx;
-    // 创建多个推理实例，并设置编码回调
     for(int i = 0; i < config.inference_threads; i++) {
         auto inference = std::make_unique<Inference>();
-        ret = inference->initialize(config.model_path.c_str(), i == 0 ? true : false, &renderer);
+        ret = inference->initialize(config.model_path.c_str(), i == 0 ? true : false);
         if(ret != 0) {
             printf("initialize inference %d error ret=%d\n", i, ret);
             return 1;
         }
         
-        // 设置编码回调
         inference->set_encode_callback([&frame_ctx](std::shared_ptr<code_frame_t> frame) {
             inference_encode_callback(&frame_ctx, frame);
         });
         
         frame_ctx.inferences.push_back(std::move(inference));
-        // printf("Inference thread %d initialized\n", i);
     }
 
     PushServer m_server_config = config.pushServer;
@@ -417,11 +429,9 @@ int main(int argc, char **argv) {
     server_raw->initZlmMedia();
 
     process_video_rtsp(&frame_ctx, config.pullStream.c_str());
-    renderer.cleanup();
 
     deinit_post_process();
 
-    // 清理资源
     frame_ctx.encoding_running = false;
     frame_ctx.pending_cv.notify_all();
     
